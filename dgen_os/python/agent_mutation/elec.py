@@ -117,6 +117,35 @@ def apply_export_tariff_params(dataframe, net_metering_state_df, net_metering_ut
     # dataframe = dataframe.drop_duplicates(subset=dataframe.columns.difference(['tariff_dict']))
     return dataframe
 
+#%%
+@decorators.fn_timer(logger=logger, tab_level=2, prefix='')
+def apply_export_tariff_params_storage(dataframe, net_metering_state_df, net_metering_utility_df):
+
+    dataframe = dataframe.reset_index()
+    
+    # specify relevant NEM columns
+    nem_columns = ['compensation_style','nem_system_kw_limit']
+    net_metering_utility_df = net_metering_utility_df[['eia_id','sector_abbr','state_abbr']+nem_columns]
+    # check if utility-specific NEM parameters apply to any agents - need to join on state too (e.g. Pacificorp UT vs Pacificorp ID)
+    temp_df = pd.merge(dataframe, net_metering_utility_df, how='left', on=['eia_id','sector_abbr','state_abbr'])
+    
+    # filter agents with non-null nem_system_kw_limit - these are agents WITH utility NEM
+    agents_with_utility_nem = temp_df[pd.notnull(temp_df['nem_system_kw_limit'])]
+    
+    # filter agents with null nem_system_kw_limit - these are agents WITHOUT utility NEM
+    agents_without_utility_nem = temp_df[pd.isnull(temp_df['nem_system_kw_limit'])].drop(nem_columns, axis=1)
+    # merge agents with state-specific NEM parameters
+    net_metering_state_df =  net_metering_state_df[['state_abbr', 'sector_abbr']+nem_columns]
+    agents_without_utility_nem = pd.merge(agents_without_utility_nem, net_metering_state_df, how='left', on=['state_abbr', 'sector_abbr'])
+    
+    # re-combine agents list and fill nan's
+    dataframe = pd.concat([agents_with_utility_nem, agents_without_utility_nem], sort=False)
+    dataframe['compensation_style'].fillna('none', inplace=True)
+    dataframe['nem_system_kw_limit'].fillna(0, inplace=True)
+    
+    dataframe = dataframe.set_index('agent_id')
+    # dataframe = dataframe.drop_duplicates(subset=dataframe.columns.difference(['tariff_dict']))
+    return dataframe
 
 #%%
 @decorators.fn_timer(logger=logger, tab_level=2, prefix='')
@@ -193,6 +222,7 @@ def apply_pv_prices(dataframe, pv_price_traj):
     dataframe = dataframe.set_index('agent_id')
 
     return dataframe
+
 
 
 #%%
@@ -499,6 +529,54 @@ def get_nem_settings(state_limits, state_by_sector, utility_by_sector, selected_
 
     return state_result, utility_result
 
+@decorators.fn_timer(logger=logger, tab_level=2, prefix='')
+def get_nem_settings_storage(state_limits, state_by_sector, utility_by_sector, selected_scenario, year, state_capacity_by_year, cf_during_peak_demand):
+
+    # Find States That Have Not Sunset
+    valid_states = filter_nem_year(state_limits, year)
+
+    # Filter States to Those That Have Not Exceeded Cumulative Capacity Constraints
+    valid_states['filter_year'] = pd.to_numeric(valid_states['max_reference_year'], errors='coerce')
+    valid_states['filter_year'][valid_states['max_reference_year'] == 'previous'] = year - 2
+    valid_states['filter_year'][valid_states['max_reference_year'] == 'current'] = year
+    valid_states['filter_year'][pd.isnull(valid_states['filter_year'])] = year
+
+    state_df = pd.merge(state_capacity_by_year, valid_states , how='left', on=['state_abbr'])
+    state_df = state_df[state_df['year'] == state_df['filter_year'] ]
+    state_df = state_df.merge(cf_during_peak_demand, on = 'state_abbr')
+
+    state_df = state_df.loc[ pd.isnull(state_df['max_cum_capacity_mw']) | ( pd.notnull( state_df['max_cum_capacity_mw']) & (state_df['cum_batt_mw'] < state_df['max_cum_capacity_mw']))]
+    # Calculate the maximum MW of solar capacity before reaching the NEM cap. MW are determine on a generation basis during the period of peak demand, as determined by ReEDS.
+    # CF during peak period is based on ReEDS H17 timeslice, assuming average over south-facing 15 degree tilt systems (so this could be improved by using the actual tilts selected)
+    state_df['max_mw'] = (state_df['max_pct_cum_capacity']/100) * state_df['peak_demand_mw'] / state_df['solar_cf_during_peak_demand_period']
+    state_df = state_df.loc[ pd.isnull(state_df['max_pct_cum_capacity']) | ( pd.notnull( state_df['max_pct_cum_capacity']) & (state_df['max_mw'] > state_df['cum_batt_mw']))]
+
+    # Filter state and sector data to those that have not sunset
+    selected_state_by_sector = state_by_sector.loc[state_by_sector['scenario'] == selected_scenario]
+    valid_state_sector = filter_nem_year(selected_state_by_sector, year)
+
+    # Filter state and sector data to those that match states which have not sunset/reached peak capacity
+    valid_state_sector = valid_state_sector[valid_state_sector['state_abbr'].isin(state_df['state_abbr'].values)]
+    
+    # Filter utility and sector data to those that have not sunset
+    selected_utility_by_sector = utility_by_sector.loc[utility_by_sector['scenario'] == selected_scenario]
+    valid_utility_sector = filter_nem_year(selected_utility_by_sector, year)
+    
+    # Filter out utility/sector combinations in states where capacity constraints have been reached
+    # Assumes that utilities adhere to broader state capacity constraints, and not their own
+    valid_utility_sector = valid_utility_sector[valid_utility_sector['state_abbr'].isin(state_df['state_abbr'].values)]
+
+    # Return State/Sector data (or null) for all combinations of states and sectors
+    full_state_list = state_by_sector.loc[ state_by_sector['scenario'] == 'BAU' ].loc[:, ['state_abbr', 'sector_abbr']]
+    state_result = pd.merge( full_state_list, valid_state_sector, how='left', on=['state_abbr','sector_abbr'] )
+    state_result['nem_system_kw_limit'].fillna(0, inplace=True)
+    
+    # Return Utility/Sector data (or null) for all combinations of utilities and sectors
+    full_utility_list = utility_by_sector.loc[ utility_by_sector['scenario'] == 'BAU' ].loc[:, ['eia_id','sector_abbr','state_abbr']]
+    utility_result = pd.merge( full_utility_list, valid_utility_sector, how='left', on=['eia_id','sector_abbr','state_abbr'] )
+    utility_result['nem_system_kw_limit'].fillna(0, inplace=True)
+
+    return state_result, utility_result
 
 def get_and_apply_agent_load_profiles(con, agent):
     inputs = locals().copy()
@@ -693,6 +771,51 @@ def apply_state_incentives(dataframe, state_incentives, year, start_year, state_
 
 #%%
 @decorators.fn_timer(logger=logger, tab_level=2, prefix='')
+def apply_state_incentives_storage(dataframe, state_incentives, year, start_year, state_capacity_by_year, end_date = datetime.date(2029, 1, 1)):
+
+    dataframe = dataframe.reset_index()
+
+    # Fill in missing end_dates
+    if bool(end_date):
+        state_incentives['end_date'][pd.isnull(state_incentives['end_date'])] = end_date
+
+    #Adjust incenctives to account for reduced values as adoption increases
+    yearly_escalation_function = lambda value, end_year: max(value - value * (1.0 / (end_year - start_year)) * (year-start_year), 0)
+    for field in ['pbi_usd_p_kwh','cbi_usd_p_w','ibi_pct','cbi_usd_p_wh']:
+        state_incentives[field] = state_incentives.apply(lambda row: yearly_escalation_function(row[field], row['end_date'].year), axis=1)
+        
+    # Filter Incentives by the Years in which they are valid
+    state_incentives = state_incentives.loc[
+        pd.isnull(state_incentives['start_date']) | (pd.to_datetime(state_incentives['start_date']).dt.year <= year)]
+    state_incentives = state_incentives.loc[
+        pd.isnull(state_incentives['end_date']) | (pd.to_datetime(state_incentives['end_date']).dt.year >= year)]
+    
+    # Combine valid incentives with the cumulative metrics for each state up until the current year
+    state_capacity_by_year = state_capacity_by_year.loc[state_capacity_by_year['year'] == year]
+    state_incentives_mg = state_incentives.merge(state_capacity_by_year,
+                                                 how='left', on=["state_abbr"])
+ 
+    # Filter where the states have not exceeded their cumulative installed capacity (by mw or pct generation) or total program budget
+    #state_incentives_mg = state_incentives_mg.loc[pd.isnull(state_incentives_mg['incentive_cap_total_pct']) | (state_incentives_mg['cum_capacity_pct'] < state_incentives_mg['incentive_cap_total_pct'])]
+    state_incentives_mg = state_incentives_mg.loc[pd.isnull(state_incentives_mg['incentive_cap_total_mw']) | (state_incentives_mg['cum_batt_mw'] < state_incentives_mg['incentive_cap_total_mw'])]
+    state_incentives_mg = state_incentives_mg.loc[pd.isnull(state_incentives_mg['budget_total_usd']) | (state_incentives_mg['cum_incentive_spending_usd'] < state_incentives_mg['budget_total_usd'])]
+
+    output  =[]
+    for i in state_incentives_mg.groupby(['state_abbr', 'sector_abbr']):
+        row = i[1]
+        state, sector = i[0]
+        output.append({'state_abbr':state, 'sector_abbr':sector,"state_incentives":row})
+
+    state_inc_df = pd.DataFrame(columns=['state_abbr', 'sector_abbr', 'state_incentives'])
+    state_inc_df = pd.concat([state_inc_df, pd.DataFrame.from_records(output)], sort=False)
+
+    dataframe = pd.merge(dataframe, state_inc_df, on=['state_abbr','sector_abbr'], how='left')
+    
+    dataframe = dataframe.set_index('agent_id')
+    return dataframe
+
+#%%
+@decorators.fn_timer(logger=logger, tab_level=2, prefix='')
 def estimate_initial_market_shares(dataframe, state_starting_capacities_df):
 
     # record input columns
@@ -759,6 +882,72 @@ def estimate_initial_market_shares(dataframe, state_starting_capacities_df):
 
     return dataframe[out_cols]
 
+#%%
+@decorators.fn_timer(logger=logger, tab_level=2, prefix='')
+def estimate_initial_market_shares_storage(dataframe, state_starting_capacities_df):
+
+    # record input columns
+    in_cols = list(dataframe.columns)
+
+    # find the total number of customers in each state (by technology and
+    # sector)
+    state_total_developable_customers = dataframe[['state_abbr', 'sector_abbr', 'tech', 'developable_agent_weight']].groupby(
+        ['state_abbr', 'sector_abbr', 'tech']).sum().reset_index()
+    state_total_agents = dataframe[['state_abbr', 'sector_abbr', 'tech', 'developable_agent_weight']].groupby(
+        ['state_abbr', 'sector_abbr', 'tech']).count().reset_index()
+    # rename the final columns
+    state_total_developable_customers.columns = state_total_developable_customers.columns.str.replace(
+        'developable_agent_weight', 'developable_customers_in_state')
+    state_total_agents.columns = state_total_agents.columns.str.replace(
+        'developable_agent_weight', 'agent_count')
+    # merge together
+    state_denominators = pd.merge(state_total_developable_customers, state_total_agents, how='left', on=[
+                                  'state_abbr', 'sector_abbr', 'tech'])
+
+    # merge back to the main dataframe
+    dataframe = pd.merge(dataframe, state_denominators, how='left', on=[
+                         'state_abbr', 'sector_abbr', 'tech'])
+
+    # merge in the state starting capacities
+    dataframe = pd.merge(dataframe, state_starting_capacities_df, how='left',
+                         on=['state_abbr', 'sector_abbr'])
+    
+
+    # determine the portion of initial load and systems that should be allocated to each agent
+    # (when there are no developable agents in the state, simply apportion evenly to all agents)
+    dataframe['portion_of_state'] = np.where(dataframe['developable_customers_in_state'] > 0,
+                                             dataframe[
+                                                 'developable_agent_weight'] / dataframe['developable_customers_in_state'],
+                                             1. / dataframe['agent_count'])
+
+    # apply the agent's portion to the total to calculate starting capacity and systems
+    #dataframe['adopters_cum_last_year'] = dataframe['portion_of_state'] * dataframe['pv_systems_count']
+    dataframe['batt_adopters_cum_last_year'] = dataframe['portion_of_state'] * dataframe['batt_systems_count']
+    #dataframe['system_kw_cum_last_year'] = dataframe['portion_of_state'] * dataframe['system_mw'] * 1000.
+    dataframe['batt_kw_cum_last_year'] = dataframe['portion_of_state'] * dataframe['batt_mw'] * 1000.0
+    dataframe['batt_kwh_cum_last_year'] = dataframe['portion_of_state'] * dataframe['batt_mwh'] * 1000.0
+
+    dataframe['market_share_last_year'] = np.where(dataframe['developable_agent_weight'] == 0, 0,
+                                                   dataframe['batt_adopters_cum_last_year'] / dataframe['developable_agent_weight'])
+
+    dataframe['market_value_last_year'] = dataframe['batt_capex_per_kw'] * dataframe['batt_kwh_cum_last_year']
+
+    # reproduce these columns as "initial" columns too
+    dataframe['initial_number_of_adopters'] = dataframe['batt_adopters_cum_last_year']
+    #dataframe['initial_pv_kw'] = dataframe['system_kw_cum_last_year']
+    dataframe['initial_batt_kw'] = dataframe['batt_kw_cum_last_year']
+    dataframe['initial_batt_kwh'] = dataframe['batt_kwh_cum_last_year']
+    dataframe['initial_market_share'] = dataframe['market_share_last_year']
+    dataframe['initial_market_value'] = 0
+
+    # isolate the return columns
+    return_cols = ['initial_number_of_adopters','initial_batt_kw','initial_batt_kwh','initial_market_share','initial_market_value','batt_adopters_cum_last_year','batt_kw_cum_last_year','batt_kwh_cum_last_year','market_share_last_year','market_value_last_year']
+
+    dataframe[return_cols] = dataframe[return_cols].fillna(0)
+
+    out_cols = in_cols + return_cols
+
+    return dataframe[out_cols]
 
 #%%
 @decorators.fn_timer(logger=logger, tab_level=2, prefix='')
@@ -770,11 +959,19 @@ def apply_market_last_year(dataframe, market_last_year_df):
 
 #%%
 @decorators.fn_timer(logger=logger, tab_level=2, prefix='')
-def estimate_total_generation(dataframe):
+def estimate_total_generation_solar(dataframe):
 
     dataframe['total_gen_twh'] = ((dataframe['number_of_adopters'] - dataframe['initial_number_of_adopters'])
                                   * dataframe['annual_energy_production_kwh'] * 1e-9) + (0.23 * 8760 * dataframe['initial_pv_kw'] * 1e-6)
 
+    return dataframe
+
+#%%
+@decorators.fn_timer(logger=logger, tab_level=2, prefix='')
+def estimate_total_generation_storage(dataframe):
+
+    dataframe['total_gen_twh'] = ((dataframe['number_of_adopters'] - dataframe['initial_number_of_adopters'])
+                                  * dataframe['annual_energy_production_kwh'] * 1e-9)
     return dataframe
 
 
@@ -818,6 +1015,44 @@ def calc_state_capacity_by_year(con, schema, load_growth, peak_demand_mw, is_fir
     
     return df
 
+@decorators.fn_timer(logger=logger, tab_level=2, prefix='')
+def calc_state_capacity_by_year_storage(con, schema, load_growth, peak_demand_mw, is_first_year, year,solar_agents, last_year_installed_capacity):
+
+    if is_first_year:
+        # get state starting capacities for solar & storage and sum by state
+        df = last_year_installed_capacity.groupby('state_abbr')[['batt_mw','batt_mwh']].sum().reset_index()
+        df.rename(columns={'batt_mw':'cum_batt_mw', 'batt_mwh':'cum_batt_mwh'}, inplace=True)
+        
+        # Not all states have starting capacity, don't want to drop any states thus left join on peak_demand
+        df = peak_demand_mw.merge(df, how='left').fillna(0)
+        
+        # rename columns
+        df.rename(columns={'peak_demand_mw_2014':'peak_demand_mw'}, inplace=True)
+
+
+    else:
+        df = last_year_installed_capacity.copy()
+        #df['cum_system_mw'] = df['system_kw_cum']/1000
+        df['cum_batt_mw'] = df['batt_kw_cum']/1000
+        df['cum_batt_mwh'] = df['batt_kwh_cum']/1000
+
+        load_growth_this_year = load_growth.loc[(load_growth['year'] == year) & (load_growth['sector_abbr'] == 'res')]
+        load_growth_this_year = pd.merge(solar_agents.df[['state_abbr', 'county_id']], load_growth_this_year, how='left', on=['county_id'])
+        load_growth_this_year = load_growth_this_year.groupby('state_abbr')['load_multiplier'].mean().reset_index()
+        df = df.merge(load_growth_this_year, on = 'state_abbr')
+        
+        df = peak_demand_mw.merge(df, how='left', on='state_abbr').fillna(0)
+        df['peak_demand_mw'] = df['peak_demand_mw_2014'] * df['load_multiplier']
+
+    # TODO: drop cum_capacity_pct from table (misnomer)
+    df['cum_capacity_pct'] = 0
+    # TODO: enforce program spending cap
+    df['cum_incentive_spending_usd'] = 0
+    df['year'] = year
+    
+    df = df[['state_abbr','cum_batt_mw','cum_batt_mwh','cum_capacity_pct','cum_incentive_spending_usd','peak_demand_mw','year']]
+    
+    return df
 
 #%%
 def get_rate_switch_table(con):

@@ -244,7 +244,9 @@ def get_technologies(con, schema):
     '''
 
     sql = """SELECT 
-                CASE WHEN run_tech = 'Solar + Storage' THEN 'solar'::text
+                CASE 
+                WHEN run_tech = 'Solar + Storage' THEN 'solar'::text
+                WHEN run_tech = 'BTM Storage' THEN 'storage'::text
                 END AS tech
             FROM {}.input_main_scenario_options;""".format(schema)
 

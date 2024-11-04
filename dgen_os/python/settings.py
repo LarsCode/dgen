@@ -304,7 +304,7 @@ class ScenarioSettings(object):
 
     def set_tech_mode(self):
 
-        if sorted(self.techs) in [['wind'], ['solar']]:
+        if sorted(self.techs) in [['wind'], ['solar'], ['storage']]:
             self.set('tech_mode', 'elec')
 
         elif self.techs == ['du']:
@@ -392,6 +392,7 @@ class ScenarioSettings(object):
             valid_options = [
                 ['wind'],
                 ['solar'],
+                ['storage'],
                 ['du'],
                 ['ghp']
             ]
